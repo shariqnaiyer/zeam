@@ -181,6 +181,42 @@ const Metrics = struct {
     // via `recordChainStateRefcountDistribution` registered as a
     // context-bearing scrape refresher (see `registerScrapeRefresherCtx`).
     lean_chain_state_refcount_distribution: LeanChainStateRefcountDistributionHistogram,
+    // Slice (e) of #803: visibility into the centralised hash-root
+    // cache. Each block ingress now carries the block_root computed
+    // once at the gossip / RPC entry point through every downstream
+    // consumer (chain.onGossip, enqueuePendingBlock,
+    // processPendingBlocks, chain.onBlock, forkchoice.onBlock).
+    // This counter bumps every time a downstream consumer was able
+    // to skip the second `hashTreeRoot` because the producer threaded
+    // a precomputed root through. The `site` label identifies the
+    // skip site (e.g. "chain.onGossip", "chain.onBlock",
+    // "chain.processPendingBlocks", "chain.enqueuePendingBlock"). A
+    // sustained 0 for any site label means the cache plumbing is
+    // broken there — useful for catching a regression that drops
+    // the root on the floor in a future refactor.
+    lean_block_root_compute_skipped_total: LeanBlockRootComputeSkippedCounter,
+    // Slice (d) of #803: visibility into the parallel net-fetch +
+    // missed-root prune dedup. Bumped per `fetchBlockByRoots` call by
+    // outcome bucket. Every entry of the input `roots` lands in
+    // exactly one bucket, so the outcome counters sum to `roots.len`
+    // per call — useful for asserting `sum(rate(lean_block_fetch_dedup_total))
+    // == sum(rate(… by outcome))` as a Grafana invariant. Buckets:
+    //   * `already_in_forkchoice` — protoArray hit on `hasBlocksBatch`.
+    //   * `already_in_block_cache` — awaiting parent or STF.
+    //   * `already_pending` — RPC in flight; another
+    //     `fetchBlockByRoots` call is already responsible.
+    //   * `fetched` — dispatched to a peer via `blocks_by_root`.
+    //   * `fetch_no_peers` — dispatch attempted but `selectPeer`
+    //     returned `error.NoPeersAvailable` (PR #842 review #1).
+    //   * `fetch_failed` — dispatch attempted but failed for any
+    //     other reason (queue full, encode failure, …).
+    //   * `dedup_lost_race` — every requested root entered
+    //     `network.pending_block_roots` or `network.block_cache`
+    //     between our `hasBlocksBatch` snapshot and the network
+    //     helper's re-check, so dispatch was suppressed (PR #842
+    //     review followup). The benign TOCTOU window is documented
+    //     in `BeamNode.fetchBlockByRoots`.
+    lean_block_fetch_dedup_total: LeanBlockFetchDedupCounter,
 
     const ChainHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 });
     const StateTransitionHistogram = metrics_lib.Histogram(f32, &[_]f32{ 0.25, 0.5, 0.75, 1, 1.25, 1.5, 2, 2.5, 3, 4 });
@@ -282,6 +318,9 @@ const Metrics = struct {
     const LeanPendingBlocksEvictedCounter = metrics_lib.CounterVec(u64, struct { reason: []const u8 });
     const LeanPendingBlocksReplayedCounter = metrics_lib.CounterVec(u64, struct { result: []const u8 });
     const LeanBlocksFutureSlotDroppedCounter = metrics_lib.Counter(u64);
+    // Slice (d)/(e) of #803.
+    const LeanBlockRootComputeSkippedCounter = metrics_lib.CounterVec(u64, struct { site: []const u8 });
+    const LeanBlockFetchDedupCounter = metrics_lib.CounterVec(u64, struct { outcome: []const u8 });
     // Validator status gauge types
     const LeanIsAggregatorGauge = metrics_lib.Gauge(u64);
     const LeanAttestationCommitteeSubnetGauge = metrics_lib.Gauge(u64);
@@ -665,6 +704,9 @@ pub fn init(allocator: std.mem.Allocator) !void {
         .lean_chain_queue_depth = try Metrics.LeanChainQueueDepthGauge.init(allocator, io, "lean_chain_queue_depth", .{ .help = "Instantaneous depth of the chain-worker queues, labeled by queue (block|attestation)." }, .{}),
         .lean_chain_worker_loop_iters_total = Metrics.LeanChainWorkerLoopItersCounter.init("lean_chain_worker_loop_iters_total", .{ .help = "Cumulative chain-worker loop iterations. External watchdogs use the delta between scrapes to detect worker stalls." }, .{}),
         .lean_chain_state_refcount_distribution = Metrics.LeanChainStateRefcountDistributionHistogram.init("lean_chain_state_refcount_distribution", .{ .help = "Distribution of refcount values across map-resident BeamState entries at scrape time. Typical value 1 (writer-only); transient 2-4 under reader concurrency; values >16 indicate leaked acquires." }, .{}),
+        // Slice (d)/(e) of #803 — see field doc for label semantics.
+        .lean_block_root_compute_skipped_total = try Metrics.LeanBlockRootComputeSkippedCounter.init(allocator, io, "lean_block_root_compute_skipped_total", .{ .help = "Total number of times a downstream consumer skipped a `hashTreeRoot(BeamBlock)` because the producer threaded a precomputed root through (slice (e) of #803). Labeled by skip site." }, .{}),
+        .lean_block_fetch_dedup_total = try Metrics.LeanBlockFetchDedupCounter.init(allocator, io, "lean_block_fetch_dedup_total", .{ .help = "Total number of `fetchBlockByRoots` per-root outcomes (slice (d) of #803). Labeled by outcome: already_in_forkchoice, already_in_block_cache, already_pending, fetched, fetch_no_peers, fetch_failed, dedup_lost_race." }, .{}),
     };
 
     // Initialize validators count to 0 by default (spec requires "On scrape" availability)
@@ -994,4 +1036,71 @@ test "registerScrapeRefresher fans out to all registered callbacks" {
     try testing.expectEqual(@as(u32, 2), Hits.second);
     try testing.expectEqual(@as(u32, 2), Hits.ctx_first);
     try testing.expectEqual(@as(u32, 2), Hits.ctx_second);
+}
+
+// Slice (d)/(e) of #803 (PR #842 review #4 / nit followup):
+// lock the metrics scrape contract for the slice (d) per-fetch dedup
+// counters and the slice (e) per-site root-compute-skipped counters
+// in code, so a label rename / family drop / serializer regression
+// fails CI here, not silently in production. Mirrors the slice-(b)
+// LockTimer audit pattern (`pkgs/node/src/locking.zig`) and the #788
+// metric audit added in PR #841.
+test "slice (d)/(e) #803: fetch-dedup + root-compute-skipped counters appear in /metrics output" {
+    if (isZKVM()) return;
+
+    try init(std.heap.page_allocator);
+
+    // Bump every label the production code emits. `incr` / `incrBy`
+    // failures are swallowed to mirror production usage (the chain /
+    // node code uses `catch {}` on every metric write).
+
+    // lean_block_root_compute_skipped_total{site} — slice (e).
+    metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.onGossip" }) catch {};
+    metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.onBlock" }) catch {};
+    metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.processPendingBlocks" }) catch {};
+    metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "forkchoice.onBlock" }) catch {};
+
+    // lean_block_fetch_dedup_total{outcome} — slice (d). PR #842
+    // review #1 added `fetch_no_peers` and `fetch_failed`; the
+    // review followup added `dedup_lost_race`. Assert all seven
+    // outcomes appear so a label rename / drop fails CI.
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "already_in_forkchoice" }, 3) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "already_in_block_cache" }, 5) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "already_pending" }, 7) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "fetched" }, 11) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "fetch_no_peers" }, 13) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "fetch_failed" }, 17) catch {};
+    metrics.lean_block_fetch_dedup_total.incrBy(.{ .outcome = "dedup_lost_race" }, 19) catch {};
+
+    var alloc_writer = std.Io.Writer.Allocating.init(testing.allocator);
+    defer alloc_writer.deinit();
+    try writeMetrics(&alloc_writer.writer);
+    const body = alloc_writer.writer.buffered();
+
+    // Top-level metric families must be advertised.
+    try testing.expect(std.mem.indexOf(u8, body, "lean_block_root_compute_skipped_total") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "lean_block_fetch_dedup_total") != null);
+
+    const skip_sites = [_][]const u8{
+        "site=\"chain.onGossip\"",
+        "site=\"chain.onBlock\"",
+        "site=\"chain.processPendingBlocks\"",
+        "site=\"forkchoice.onBlock\"",
+    };
+    for (skip_sites) |lbl| {
+        try testing.expect(std.mem.indexOf(u8, body, lbl) != null);
+    }
+
+    const fetch_outcomes = [_][]const u8{
+        "outcome=\"already_in_forkchoice\"",
+        "outcome=\"already_in_block_cache\"",
+        "outcome=\"already_pending\"",
+        "outcome=\"fetched\"",
+        "outcome=\"fetch_no_peers\"",
+        "outcome=\"fetch_failed\"",
+        "outcome=\"dedup_lost_race\"",
+    };
+    for (fetch_outcomes) |lbl| {
+        try testing.expect(std.mem.indexOf(u8, body, lbl) != null);
+    }
 }

@@ -97,12 +97,16 @@ pub const ProducedBlock = struct {
     }
 };
 
-/// Future-block queue entry (issue #788).
+/// Future-block queue entry. Used by both #788 (clock-lag
+/// future-block buffering) and slice (e) of #803 (centralised
+/// hash-root cache). Stores the producer's already-computed
+/// hash-tree root alongside the block so the gossip-path dedup
+/// loop, the `enqueuePendingBlock` cap-eviction sweep, and the
+/// drain (`processPendingBlocks`) all compare 32 bytes instead of
+/// re-hashing the full block body.
 ///
-/// Stores the producer's already-computed hash-tree root alongside the
-/// block so the gossip-path dedup loop and the drain don't have to
-/// re-hash. PR #841 review: `hashTreeRoot(BeamBlock, ...)` is a full
-/// SSZ tree walk — doing it 1024 times per duplicate-check is
+/// PR #841 review: `hashTreeRoot(BeamBlock, ...)` is a full SSZ
+/// tree walk — doing it 1024 times per duplicate-check is
 /// observable under a sustained clock-lag flood, which is the exact
 /// scenario the future-block queue exists to handle. Storing the
 /// 32-byte root here drops dedup from O(N·hash) to O(N·memcmp).
@@ -113,6 +117,9 @@ pub const ProducedBlock = struct {
 /// `backfill_depth`) are deliberately omitted in this PR — they hook
 /// into peer scoring + staleness detection that don't have consumers
 /// in zeam yet. Tracked as follow-up cleanup in #788's PR thread.
+///
+/// Heap-owning data is the `signed_block` SSZ slices; the entry must
+/// be `signed_block.deinit()`d when removed.
 pub const PendingBlockEntry = struct {
     signed_block: types.SignedBlock,
     block_root: types.Root,
@@ -410,10 +417,20 @@ pub const BeamChain = struct {
         ctx: *anyopaque,
         signed_block: types.SignedBlock,
         prune_forkchoice: bool,
+        block_root: ?types.Root,
     ) void {
         const self: *Self = @ptrCast(@alignCast(ctx));
+        // Slice (e) of #803: forward the producer's already-computed
+        // block_root (when present) into `onBlock` via
+        // `CachedProcessedBlockInfo.blockRoot`. Saves the worker thread
+        // a redundant `hashTreeRoot(BeamBlock)` call — a non-trivial
+        // SSZ traversal on a wide block body. `null` falls back to the
+        // pre-existing in-`onBlock` recompute path; this keeps callers
+        // that legitimately have no precomputed root (the c-1 stub /
+        // any future producer) working unchanged.
         const missing_roots = self.onBlock(signed_block, .{
             .pruneForkchoice = prune_forkchoice,
+            .blockRoot = block_root,
         }) catch |err| {
             self.logger.err("chain-worker: onBlock failed slot={d}: {any}", .{
                 signed_block.block.slot,
@@ -515,15 +532,26 @@ pub const BeamChain = struct {
     pub const SubmitError = chain_worker.BlockQueue.TrySendError || error{ChainWorkerDisabled};
 
     /// Route a block import through the chain-worker queue.
+    ///
+    /// Slice (e) of #803: `block_root` is the producer's already-
+    /// computed hash-tree root of `signed_block.block`. Pass `null`
+    /// only when the producer truly does not have one (and the
+    /// worker will recompute it inside `onBlock`). All current
+    /// production producers DO have a precomputed root — see
+    /// `BeamNode.onGossip`, `processBlockByRoot|RangeChunk`,
+    /// `publishBlock`, and `chain.onGossip` itself — so the
+    /// `null` path is a fallback for tests / future variants.
     pub fn submitBlock(
         self: *Self,
         signed_block: types.SignedBlock,
         prune_forkchoice: bool,
+        block_root: ?types.Root,
     ) SubmitError!void {
         const w = self.chain_worker orelse return error.ChainWorkerDisabled;
         try w.sendBlock(.{ .on_block = .{
             .signed_block = signed_block,
             .prune_forkchoice = prune_forkchoice,
+            .block_root = block_root,
         } });
     }
 
@@ -629,6 +657,7 @@ pub const BeamChain = struct {
         // Clean up root to slot cache
         self.root_to_slot_cache.deinit();
         // Clean up any blocks that were queued waiting for the forkchoice clock
+        // (each entry wraps the SignedBlock + its precomputed root).
         for (self.pending_blocks.items) |*entry| {
             entry.signed_block.deinit();
         }
@@ -1298,10 +1327,10 @@ pub const BeamChain = struct {
             // review #8.
             const too_far_future_slot: types.Slot = current_slot +| constants.MAX_FUTURE_SLOT_QUEUE_TOLERANCE;
 
-            // Pop the first ready block under the lock; release before any
+            // Pop the first ready entry under the lock; release before any
             // heavy work so gossip-thread appends can proceed.
             //
-            // The scan is an in-place compaction (review #6: prior
+            // The scan is an in-place compaction (PR #841 review #6: prior
             // `orderedRemove(i)` per dropped entry was O(N²) under flood).
             // Walk forward, copy keepers down to a write pointer; when we
             // see the first "ready" block (slot * intervals <= fc_time)
@@ -1351,9 +1380,13 @@ pub const BeamChain = struct {
                 defer queued_entry.signed_block.deinit();
 
                 const queued_slot = queued_entry.signed_block.block.slot;
-                // PR #841 review #5: use the cached root from the queue
-                // entry instead of re-hashing the block.
-                const block_root = queued_entry.block_root;
+                // PR #841 review #5 + slice (e) of #803: use the cached
+                // root from the queue entry instead of re-hashing the
+                // block. The root was stamped at gossip ingress — SSZ is
+                // collision-resistant, so this is identical to what the
+                // pre-cache path computed at this point.
+                const block_root: types.Root = queued_entry.block_root;
+                zeam_metrics.metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.processPendingBlocks" }) catch {};
 
                 self.logger.info(
                     "replaying queued block slot={d} blockroot=0x{x} (fc_time now={d})",
@@ -1798,12 +1831,35 @@ pub const BeamChain = struct {
         });
     }
 
-    pub fn onGossip(self: *Self, data: *const networks.GossipMessage, sender_peer_id: []const u8) !GossipProcessingResult {
+    /// Process an incoming gossip message.
+    ///
+    /// Slice (e) of #803: `precomputed_block_root` is the producer's
+    /// already-computed `hashTreeRoot(BeamBlock, signed_block.block)`.
+    /// Pass `null` only when the producer truly does not have one
+    /// — every current production gossip producer DOES (see
+    /// `BeamNode.onGossip` which computes it before taking any
+    /// per-resource lock so it can be reused across the lock-free
+    /// pre-check fan-out and this call). The block branch threads the
+    /// root through `validateBlock` → `enqueuePendingBlock` →
+    /// `submitBlock`/`onBlock` so a single block traversal is paid
+    /// once per ingress, not 3–4 times.
+    pub fn onGossip(
+        self: *Self,
+        data: *const networks.GossipMessage,
+        sender_peer_id: []const u8,
+        precomputed_block_root: ?types.Root,
+    ) !GossipProcessingResult {
         switch (data.*) {
             .block => |signed_block| {
                 const block = signed_block.block;
-                var block_root: [32]u8 = undefined;
-                try zeam_utils.hashTreeRoot(types.BeamBlock, block, &block_root, self.allocator);
+                const block_root: [32]u8 = if (precomputed_block_root) |r| r else r: {
+                    var cblock_root: [32]u8 = undefined;
+                    try zeam_utils.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
+                    break :r cblock_root;
+                };
+                if (precomputed_block_root != null) {
+                    zeam_metrics.metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.onGossip" }) catch {};
+                }
 
                 //check if we have the block already in forkchoice
                 const hasBlock = self.forkChoice.hasBlock(block_root);
@@ -1918,7 +1974,9 @@ pub const BeamChain = struct {
                         try types.sszClone(self.allocator, types.SignedBlock, signed_block, &cloned);
                         var cloned_consumed = false;
                         errdefer if (!cloned_consumed) cloned.deinit();
-                        self.submitBlock(cloned, true) catch |err| switch (err) {
+                        // Slice (e): forward the block_root we already computed
+                        // above so the worker thread doesn't re-hash the block.
+                        self.submitBlock(cloned, true, block_root) catch |err| switch (err) {
                             error.QueueFull => {
                                 self.logger.warn(
                                     "chain-worker: block queue full, dropping slot={d} root=0x{x}",
@@ -2119,11 +2177,34 @@ pub const BeamChain = struct {
 
         const block = signedBlock.block;
 
-        const block_root: types.Root = blockInfo.blockRoot orelse computedroot: {
+        const block_root: types.Root = if (blockInfo.blockRoot) |r| r else r: {
             var cblock_root: [32]u8 = undefined;
             try zeam_utils.hashTreeRoot(types.BeamBlock, block, &cblock_root, self.allocator);
-            break :computedroot cblock_root;
+            break :r cblock_root;
         };
+        if (blockInfo.blockRoot != null) {
+            zeam_metrics.metrics.lean_block_root_compute_skipped_total.incr(.{ .site = "chain.onBlock" }) catch {};
+            // PR #842 review #2: see the rationale in
+            // `forkchoice.onBlock`. Same trust-but-verify pattern at
+            // the chain-level public API boundary; debug + ReleaseSafe
+            // only, free in `ReleaseFast` / `ReleaseSmall`.
+            if (std.debug.runtime_safety) verify: {
+                var verify_root: [32]u8 = undefined;
+                zeam_utils.hashTreeRoot(types.BeamBlock, block, &verify_root, self.allocator) catch |err| {
+                    self.logger.warn(
+                        "chain.onBlock: blockRoot verification re-hash failed: {any}",
+                        .{err},
+                    );
+                    break :verify;
+                };
+                if (!std.mem.eql(u8, &block_root, &verify_root)) {
+                    std.debug.panic(
+                        "chain.onBlock: caller-supplied blockRoot=0x{x} does NOT match recomputed=0x{x} for block slot={d} — forkchoice protoArray would be silently corrupted; call site bug",
+                        .{ &block_root, &verify_root, block.slot },
+                    );
+                }
+            }
+        }
 
         const post_state_owned = blockInfo.postState == null;
         const post_state = if (blockInfo.postState) |post_state_ptr| post_state_ptr else computedstate: {
@@ -6294,7 +6375,11 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
     var cloned_consumed = false;
     errdefer if (!cloned_consumed) cloned.deinit();
 
-    try beam_chain.submitBlock(cloned, false);
+    // Slice (e) of #803: pass `null` for `block_root` so the
+    // worker recomputes — this test deliberately exercises the
+    // fallback path. End-to-end gossip path coverage runs through
+    // the chain-worker stress harness in `stress.zig`.
+    try beam_chain.submitBlock(cloned, false, null);
     cloned_consumed = true;
 
     // Wait for the worker to drain the queue. We poll on the
@@ -6393,7 +6478,7 @@ test "chain-worker: end-to-end submitBlock advances state via the worker thread"
     defer off_cloned.deinit();
     try std.testing.expectError(
         error.ChainWorkerDisabled,
-        beam_chain_off.submitBlock(off_cloned, false),
+        beam_chain_off.submitBlock(off_cloned, false, null),
     );
 }
 
