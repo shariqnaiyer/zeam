@@ -1476,67 +1476,82 @@ pub const BeamChain = struct {
             has_proposal,
         });
 
+        // Only forkchoice tick failure means the chain clock did not advance.
         try self.forkChoice.onInterval(time_intervals, has_proposal);
+
         if (interval == 1) {
             // interval to attest so we should put out the chain status information to the user along with
             // latest head which most likely should be the new block received and processed
             const islot: isize = @intCast(slot);
             self.printSlot(islot, constants.MAX_FC_CHAIN_PRINT_DEPTH, self.connected_peers.count());
 
-            // Periodic pruning: prune old non-canonical states every N slots
-            // This ensures we prune even when finalization doesn't advance
+            // Pruning is housekeeping; do not fail the already-applied tick.
             if (slot > 0 and slot % constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS == 0) {
-                const finalized = self.forkChoice.getLatestFinalized();
-                // no need to work extra if finalization is not far behind
-                if (finalized.slot + 2 * constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS < slot) {
-                    self.logger.warn("finalization slot={d} too far behind the current slot={d}", .{ finalized.slot, slot });
-                    const pruningAnchor = try self.forkChoice.getCanonicalAncestorAtDepth(constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS);
-
-                    // prune if finalization hasn't happened since a long time
-                    if (pruningAnchor.slot > finalized.slot) {
-                        self.logger.info("periodic pruning triggered at slot {d} (finalized slot={d} pruning anchor={d})", .{
-                            slot,
-                            finalized.slot,
-                            pruningAnchor.slot,
-                        });
-                        const analysis_result = try self.forkChoice.getCanonicalityAnalysis(pruningAnchor.blockRoot, finalized.root, null);
-                        const depth_confirmed_roots = analysis_result[0];
-                        const non_finalized_descendants = analysis_result[1];
-                        const non_canonical_roots = analysis_result[2];
-                        defer self.allocator.free(depth_confirmed_roots);
-                        defer self.allocator.free(non_finalized_descendants);
-                        defer self.allocator.free(non_canonical_roots);
-
-                        const states_count_before: isize = self.states.count();
-                        _ = self.pruneStates(depth_confirmed_roots[1..depth_confirmed_roots.len], "confirmed ancestors");
-                        _ = self.pruneStates(non_canonical_roots, "confirmed non canonical");
-                        const pruned_count = states_count_before - self.states.count();
-                        self.logger.info("pruned states={d} at slot={d} (finalized slot={d} pruning anchor={d})", .{
-                            //
-                            pruned_count,
-                            slot,
-                            finalized.slot,
-                            pruningAnchor.slot,
-                        });
-                    } else {
-                        self.logger.info("skipping periodic pruning at slot={d} since finalization not behind pruning anchor (finalized slot={d} pruning anchor={d})", .{
-                            slot,
-                            finalized.slot,
-                            pruningAnchor.slot,
-                        });
-                    }
-                } else {
-                    self.logger.info("skipping periodic pruning at current slot={d} since finalization slot={d} not behind", .{
-                        slot,
-                        finalized.slot,
-                    });
-                }
+                self.runPeriodicPruning(slot) catch |err| {
+                    self.logger.err(
+                        "periodic pruning failed at slot={d}: {any} (continuing tick)",
+                        .{ slot, err },
+                    );
+                    zeam_metrics.metrics.lean_node_interval_error_total.incr(
+                        .{ .site = "chain.runPeriodicPruning" },
+                    ) catch |me| self.logger.warn("metric incr failed: {any}", .{me});
+                };
             }
         }
         // check if log rotation is needed
         self.zeam_logger_config.maybeRotate() catch |err| {
             self.logger.err("error rotating log file: {any}", .{err});
         };
+    }
+
+    /// Periodic pruning helper; caller logs and continues on failure.
+    fn runPeriodicPruning(self: *Self, slot: types.Slot) !void {
+        const finalized = self.forkChoice.getLatestFinalized();
+        // no need to work extra if finalization is not far behind
+        if (finalized.slot + 2 * constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS >= slot) {
+            self.logger.info("skipping periodic pruning at current slot={d} since finalization slot={d} not behind", .{
+                slot,
+                finalized.slot,
+            });
+            return;
+        }
+
+        self.logger.warn("finalization slot={d} too far behind the current slot={d}", .{ finalized.slot, slot });
+        const pruningAnchor = try self.forkChoice.getCanonicalAncestorAtDepth(constants.FORKCHOICE_PRUNING_INTERVAL_SLOTS);
+
+        // prune if finalization hasn't happened since a long time
+        if (pruningAnchor.slot <= finalized.slot) {
+            self.logger.info("skipping periodic pruning at slot={d} since finalization not behind pruning anchor (finalized slot={d} pruning anchor={d})", .{
+                slot,
+                finalized.slot,
+                pruningAnchor.slot,
+            });
+            return;
+        }
+
+        self.logger.info("periodic pruning triggered at slot {d} (finalized slot={d} pruning anchor={d})", .{
+            slot,
+            finalized.slot,
+            pruningAnchor.slot,
+        });
+        const analysis_result = try self.forkChoice.getCanonicalityAnalysis(pruningAnchor.blockRoot, finalized.root, null);
+        const depth_confirmed_roots = analysis_result[0];
+        const non_finalized_descendants = analysis_result[1];
+        const non_canonical_roots = analysis_result[2];
+        defer self.allocator.free(depth_confirmed_roots);
+        defer self.allocator.free(non_finalized_descendants);
+        defer self.allocator.free(non_canonical_roots);
+
+        const states_count_before: isize = self.states.count();
+        _ = self.pruneStates(depth_confirmed_roots[1..depth_confirmed_roots.len], "confirmed ancestors");
+        _ = self.pruneStates(non_canonical_roots, "confirmed non canonical");
+        const pruned_count = states_count_before - self.states.count();
+        self.logger.info("pruned states={d} at slot={d} (finalized slot={d} pruning anchor={d})", .{
+            pruned_count,
+            slot,
+            finalized.slot,
+            pruningAnchor.slot,
+        });
     }
 
     pub fn produceBlock(self: *Self, opts: BlockProductionParams) !ProducedBlock {
