@@ -633,14 +633,10 @@ pub const AggregatedAttestationsResult = struct {
             if (!has_gossip and selected_children.items.len == 1) {
                 const child = &selected_children.items[0];
 
-                // Create attestation bits from the child's participants
-                var att_bits: ?attestation.AggregationBits = try attestation.AggregationBits.init(allocator);
+                var att_bits_val: attestation.AggregationBits = undefined;
+                try utils.sszClone(allocator, attestation.AggregationBits, child.participants, &att_bits_val);
+                var att_bits: ?attestation.AggregationBits = att_bits_val;
                 defer if (att_bits) |*ab| ab.deinit();
-                for (0..child.participants.len()) |i| {
-                    if (child.participants.get(i) catch false) {
-                        try attestation.aggregationBitsSet(&att_bits.?, i, true);
-                    }
-                }
 
                 // Clone the child proof for the result (original will be freed by deferred cleanup)
                 var cloned_child: aggregation.AggregatedSignatureProof = undefined;
@@ -715,14 +711,10 @@ pub const AggregatedAttestationsResult = struct {
             if (xmss_participants) |*gp| gp.deinit();
             xmss_participants = null;
 
-            // Create attestation from the proof's merged participants
-            var att_bits: ?attestation.AggregationBits = try attestation.AggregationBits.init(allocator);
+            var att_bits_val: attestation.AggregationBits = undefined;
+            try utils.sszClone(allocator, attestation.AggregationBits, proof.participants, &att_bits_val);
+            var att_bits: ?attestation.AggregationBits = att_bits_val;
             defer if (att_bits) |*ab| ab.deinit();
-            for (0..proof.participants.len()) |i| {
-                if (proof.participants.get(i) catch false) {
-                    try attestation.aggregationBitsSet(&att_bits.?, i, true);
-                }
-            }
 
             try self.attestations.append(.{ .aggregation_bits = att_bits.?, .data = data });
             att_bits = null; // ownership transferred to self.attestations
@@ -859,13 +851,9 @@ fn compactSingleProof(
     try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, sig.*, &cloned_proof);
     errdefer cloned_proof.deinit();
 
-    var att_bits = try attestation.AggregationBits.init(allocator);
+    var att_bits: attestation.AggregationBits = undefined;
+    try utils.sszClone(allocator, attestation.AggregationBits, cloned_proof.participants, &att_bits);
     errdefer att_bits.deinit();
-    for (0..cloned_proof.participants.len()) |i| {
-        if (cloned_proof.participants.get(i) catch false) {
-            try attestation.aggregationBitsSet(&att_bits, i, true);
-        }
-    }
 
     return .{
         .attestation = .{ .aggregation_bits = att_bits, .data = att_data },
@@ -911,13 +899,9 @@ fn compactMultiProofWithPrep(
         &proof,
     );
 
-    var att_bits = try attestation.AggregationBits.init(allocator);
+    var att_bits: attestation.AggregationBits = undefined;
+    try utils.sszClone(allocator, attestation.AggregationBits, proof.participants, &att_bits);
     errdefer att_bits.deinit();
-    for (0..proof.participants.len()) |i| {
-        if (proof.participants.get(i) catch false) {
-            try attestation.aggregationBitsSet(&att_bits, i, true);
-        }
-    }
 
     return .{
         .attestation = .{ .aggregation_bits = att_bits, .data = att_data },

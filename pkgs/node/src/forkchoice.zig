@@ -1071,12 +1071,12 @@ pub const ForkChoice = struct {
                     try types.sszClone(self.allocator, types.AggregatedSignatureProof, best_proof.?.*, &cloned_proof);
                     errdefer cloned_proof.deinit();
 
-                    var att_bits = try types.AggregationBits.init(self.allocator);
+                    var att_bits: types.AggregationBits = undefined;
+                    try types.sszClone(self.allocator, types.AggregationBits, cloned_proof.participants, &att_bits);
                     errdefer att_bits.deinit();
 
                     for (0..cloned_proof.participants.len()) |i| {
                         if (cloned_proof.participants.get(i) catch false) {
-                            try types.aggregationBitsSet(&att_bits, i, true);
                             if (i >= covered.capacity()) {
                                 try covered.resize(i + 1, false);
                             }
