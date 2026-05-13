@@ -1399,3 +1399,71 @@ test "encode decode signed block with non-empty attestation signatures" {
     const decoded_group = try decoded.signature.attestation_signatures.get(0);
     try std.testing.expect(decoded_group.participants.len() == 2);
 }
+
+// Regression: an AggregatedSignatureProof whose `participants` bitlist
+// has trailing zero bits (i.e., len() > highest_set_bit + 1) must still
+// produce an `aggregation_bits` that is byte-for-byte identical to
+// `participants`. Rebuilding `aggregation_bits` by re-setting only the
+// TRUE indices would shrink it to highest_set_bit + 1, changing its SSZ
+// encoding and causing other clients (e.g. ethlambda) to reject the
+// block with a ParticipantsMismatch error.
+test "compactSingleProof: aggregation_bits matches participants when participants has trailing zeros" {
+    const allocator = std.testing.allocator;
+
+    var proof = try aggregation.AggregatedSignatureProof.init(allocator);
+    defer proof.deinit();
+
+    // Force participants.len() == 6 with bits set only at {0, 2}.
+    // aggregationBitsSet(.., 5, false) extends to length 6 and leaves bit 5 clear.
+    try attestation.aggregationBitsSet(&proof.participants, 5, false);
+    try attestation.aggregationBitsSet(&proof.participants, 0, true);
+    try attestation.aggregationBitsSet(&proof.participants, 2, true);
+
+    try std.testing.expectEqual(@as(usize, 6), proof.participants.len());
+
+    const att_data = attestation.AttestationData{
+        .slot = 1,
+        .head = .{ .root = ZERO_HASH, .slot = 0 },
+        .target = .{ .root = ZERO_HASH, .slot = 0 },
+        .source = .{ .root = ZERO_HASH, .slot = 0 },
+    };
+
+    var result = try compactSingleProof(allocator, att_data, &proof);
+    defer {
+        result.attestation.deinit();
+        result.signature.deinit();
+    }
+
+    try std.testing.expectEqual(
+        result.signature.participants.len(),
+        result.attestation.aggregation_bits.len(),
+    );
+    for (0..result.signature.participants.len()) |i| {
+        try std.testing.expectEqual(
+            try result.signature.participants.get(i),
+            try result.attestation.aggregation_bits.get(i),
+        );
+    }
+
+    // SSZ-encoded forms must also be identical so cross-client strict
+    // equality checks pass.
+    var participants_bytes: std.ArrayList(u8) = .empty;
+    defer participants_bytes.deinit(allocator);
+    try ssz.serialize(
+        attestation.AggregationBits,
+        result.signature.participants,
+        &participants_bytes,
+        allocator,
+    );
+
+    var bits_bytes: std.ArrayList(u8) = .empty;
+    defer bits_bytes.deinit(allocator);
+    try ssz.serialize(
+        attestation.AggregationBits,
+        result.attestation.aggregation_bits,
+        &bits_bytes,
+        allocator,
+    );
+
+    try std.testing.expectEqualSlices(u8, participants_bytes.items, bits_bytes.items);
+}
