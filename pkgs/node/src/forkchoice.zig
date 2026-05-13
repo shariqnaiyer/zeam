@@ -1117,13 +1117,9 @@ pub const ForkChoice = struct {
             }
 
             for (agg_attestations.constSlice()) |agg_att| {
-                var cloned_bits = try types.AggregationBits.init(self.allocator);
+                var cloned_bits: types.AggregationBits = undefined;
+                try types.sszClone(self.allocator, types.AggregationBits, agg_att.aggregation_bits, &cloned_bits);
                 errdefer cloned_bits.deinit();
-                for (0..agg_att.aggregation_bits.len()) |i| {
-                    if (agg_att.aggregation_bits.get(i) catch false) {
-                        try types.aggregationBitsSet(&cloned_bits, i, true);
-                    }
-                }
                 try candidate_atts.append(.{ .aggregation_bits = cloned_bits, .data = agg_att.data });
             }
 
