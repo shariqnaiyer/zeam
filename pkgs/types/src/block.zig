@@ -635,15 +635,14 @@ pub const AggregatedAttestationsResult = struct {
 
                 var att_bits: attestation.AggregationBits = undefined;
                 try utils.sszClone(allocator, attestation.AggregationBits, child.participants, &att_bits);
-                defer att_bits.deinit();
+                errdefer att_bits.deinit(); // ownership is for self.attestations
 
                 // Clone the child proof for the result (original will be freed by deferred cleanup)
                 var cloned_child: aggregation.AggregatedSignatureProof = undefined;
                 try utils.sszClone(allocator, aggregation.AggregatedSignatureProof, child.*, &cloned_child);
                 errdefer cloned_child.deinit();
 
-                try self.attestations.append(.{ .aggregation_bits = att_bits.?, .data = data });
-                att_bits = null; // ownership transferred to self.attestations
+                try self.attestations.append(.{ .aggregation_bits = att_bits, .data = data });
                 try self.attestation_signatures.append(cloned_child);
                 continue;
             }
@@ -712,10 +711,9 @@ pub const AggregatedAttestationsResult = struct {
 
             var att_bits: attestation.AggregationBits = undefined;
             try utils.sszClone(allocator, attestation.AggregationBits, proof.participants, &att_bits);
-            defer att_bits.deinit();
+            errdefer att_bits.deinit(); // ownership is for self.attestations
 
-            try self.attestations.append(.{ .aggregation_bits = att_bits.?, .data = data });
-            att_bits = null; // ownership transferred to self.attestations
+            try self.attestations.append(.{ .aggregation_bits = att_bits, .data = data });
             try self.attestation_signatures.append(proof);
         }
     }
